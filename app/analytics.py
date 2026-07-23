@@ -20,10 +20,8 @@ class TelemetryAnalyzer:
     ) -> None:
         self.log_path = Path(log_path)
         self.log_path.parent.mkdir(parents=True, exist_ok=True)
-
         self.stop_distance_cm = stop_distance_cm
         self.caution_distance_cm = caution_distance_cm
-
         self._samples: deque[int] = deque(maxlen=window_size)
         self._events: deque[dict[str, Any]] = deque(maxlen=50)
         self._last_filtered: int | None = None
@@ -34,7 +32,6 @@ class TelemetryAnalyzer:
         with self._lock:
             self._samples.append(distance_cm)
             filtered = round(statistics.median(self._samples))
-
             if filtered <= self.stop_distance_cm:
                 state = "OBSTACLE"
             elif filtered <= self.caution_distance_cm:
@@ -43,11 +40,8 @@ class TelemetryAnalyzer:
                 state = "CLEAR"
 
             change_rate = (
-                0
-                if self._last_filtered is None
-                else filtered - self._last_filtered
+                0 if self._last_filtered is None else filtered - self._last_filtered
             )
-
             result = {
                 "distance_cm": distance_cm,
                 "filtered_distance_cm": filtered,
@@ -60,6 +54,7 @@ class TelemetryAnalyzer:
             if state != self._last_state:
                 event = {
                     "type": "proximity_state_change",
+                    "source": "rover",
                     "state": state,
                     "filtered_distance_cm": filtered,
                     "timestamp": timestamp,

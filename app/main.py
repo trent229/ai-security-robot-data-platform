@@ -1,16 +1,20 @@
-"""Web dashboard joining the Jetson camera runtime and rover telemetry."""
+"""Web dashboard joining camera feeds, Ring events, and rover telemetry."""
 
 from __future__ import annotations
 
+import json
 import os
+from pathlib import Path
 import threading
 from datetime import datetime, timezone
 
-from flask import Flask, jsonify, render_template_string
+from flask import Flask, jsonify, render_template_string, send_file
 
+from app.analytics import TelemetryAnalyzer
+from app.ring_camera import RingCameraCollector
 from app.rover import RoverError, RoverSerial
 from app.rover_tcp import RoverTCP
-from app.analytics import TelemetryAnalyzer
+from app.sure_sight import SureSightCollector
 
 CAMERA_STREAM_URL = os.getenv(
     "CAMERA_STREAM_URL", "http://127.0.0.1:5000/stream.mjpg"
@@ -23,12 +27,37 @@ ROVER_TRANSPORT = os.getenv("ROVER_TRANSPORT", "tcp").lower()
 ROVER_HOST = os.getenv("ROVER_HOST", "192.168.1.251")
 ROVER_TCP_PORT = int(os.getenv("ROVER_TCP_PORT", "100"))
 
+RING_ENABLED = os.getenv("RING_ENABLED", "false").lower() in {"1", "true", "yes", "on"}
+RING_DEVICE_NAME = os.getenv("RING_DEVICE_NAME", "")
+RING_TOKEN_PATH = os.getenv("RING_TOKEN_PATH", "runtime/ring_token.json")
+RING_POLL_SECONDS = int(os.getenv("RING_POLL_SECONDS", "30"))
+RING_SNAPSHOT_PATH = os.getenv("RING_SNAPSHOT_PATH", "runtime/ring_latest.jpg")
+EVENT_LOG_PATH = os.getenv("EVENT_LOG_PATH", "runtime/events.jsonl")
+SURE_SIGHT_STATUS_URL = os.getenv(
+    "SURE_SIGHT_STATUS_URL", "http://127.0.0.1:5000/api/status"
+)
+SURE_SIGHT_POLL_SECONDS = float(os.getenv("SURE_SIGHT_POLL_SECONDS", "1"))
+
 app = Flask(__name__)
 if ROVER_TRANSPORT == "serial":
     rover = RoverSerial(port=ROVER_PORT)
 else:
     rover = RoverTCP(host=ROVER_HOST, port=ROVER_TCP_PORT)
-    analyzer = TelemetryAnalyzer()
+
+analyzer = TelemetryAnalyzer(log_path=EVENT_LOG_PATH)
+ring_collector = RingCameraCollector(
+    enabled=RING_ENABLED,
+    token_path=RING_TOKEN_PATH,
+    device_name=RING_DEVICE_NAME,
+    poll_seconds=RING_POLL_SECONDS,
+    snapshot_path=RING_SNAPSHOT_PATH,
+    event_log_path=EVENT_LOG_PATH,
+)
+sure_sight_collector = SureSightCollector(
+    status_url=SURE_SIGHT_STATUS_URL,
+    poll_seconds=SURE_SIGHT_POLL_SECONDS,
+    event_log_path=EVENT_LOG_PATH,
+)
 
 DASHBOARD = """
 <!doctype html>
@@ -44,15 +73,15 @@ DASHBOARD = """
     h1 { margin: 0; font-size: clamp(20px, 3vw, 32px); }
     main { display: grid; gap: 16px; padding: 16px; grid-template-columns: 1fr 1fr; }
     .card { background: #102330; border: 1px solid #21455e; border-radius: 12px; padding: 14px; }
-    .camera { width: 100%; max-height: 72vh; object-fit: contain; background: #000; }
+    .camera { width: 100%; max-height: 55vh; object-fit: contain; background: #000; }
     .reading { font-size: 48px; font-weight: 700; color: #5eead4; }
-    .status { color: #9fc2d8; }
-    .telemetry { grid-column: 1 / -1; }
+    .status { color: #9fc2d8; white-space: pre-line; }
+    .wide { grid-column: 1 / -1; }
     button { width: 100%; margin-top: 10px; padding: 14px; border: 0; border-radius: 8px;
              font-size: 17px; font-weight: 700; cursor: pointer; }
     .stop { background: #ef4444; color: white; }
     .auto { background: #22c55e; color: #04130a; }
-    @media (max-width: 800px) { main { grid-template-columns: 1fr; } }
+    @media (max-width: 800px) { main { grid-template-columns: 1fr; } .wide { grid-column: auto; } }
   </style>
 </head>
 <body>
@@ -66,19 +95,31 @@ DASHBOARD = """
       <h2>Rover Camera</h2>
       <img id="rover-camera" class="camera" alt="Rover camera">
     </section>
-    <section class="card telemetry">
+    <section class="card">
+      <h2>Ring Camera Data</h2>
+      <img id="ring-snapshot" class="camera" alt="Latest Ring snapshot">
+      <p id="ring-status" class="status">Loading Ring status…</p>
+    </section>
+    <section class="card">
       <h2>Rover Telemetry</h2>
       <div id="distance" class="reading">-- cm</div>
       <p id="status" class="status">Connecting to rover…</p>
       <button class="stop" onclick="commandRover('stop')">Emergency Stop</button>
       <button class="auto" onclick="startAutonomous()">Start Autonomous Mode</button>
     </section>
+    <section class="card wide">
+      <h2>Sure Sight Runtime</h2>
+      <p id="sure-sight-status" class="status">Loading Sure Sight status…</p>
+    </section>
+    <section class="card wide">
+      <h2>Combined Event Timeline</h2>
+      <p id="event-timeline" class="status">Loading recorded events…</p>
+    </section>
   </main>
   <script>
     document.getElementById('fixed-camera').src =
       `${location.protocol}//${location.hostname}:5000/stream.mjpg`;
     document.getElementById('rover-camera').src = {{ rover_camera_url|tojson }};
-    setInterval(() => { document.getElementById('rover-camera').src = {{ rover_camera_url|tojson }} + '?t=' + Date.now(); }, 10000);
 
     async function refreshDistance() {
       const status = document.getElementById('status');
@@ -88,21 +129,57 @@ DASHBOARD = """
         if (!response.ok) throw new Error(data.error || 'Rover unavailable');
         const distance = document.getElementById('distance');
         distance.textContent = `${data.filtered_distance_cm} cm`;
-
-        const stateColors = {
-          CLEAR: '#5eead4',
-          CAUTION: '#facc15',
-          OBSTACLE: '#ef4444'
-        };
-        distance.style.color = stateColors[data.proximity_state] || '#5eead4';
-
-        status.textContent =
-          `${data.proximity_state} • Raw: ${data.distance_cm} cm • ` +
-          `Filtered: ${data.filtered_distance_cm} cm • ` +
-          `${new Date(data.timestamp).toLocaleTimeString()}`;
+        const colors = {CLEAR:'#5eead4', CAUTION:'#facc15', OBSTACLE:'#ef4444'};
+        distance.style.color = colors[data.proximity_state] || '#5eead4';
+        status.textContent = `${data.proximity_state} • Raw: ${data.distance_cm} cm • ` +
+          `Filtered: ${data.filtered_distance_cm} cm • ${new Date(data.timestamp).toLocaleTimeString()}`;
       } catch (error) {
         status.textContent = error.message;
       }
+    }
+
+    async function refreshRing() {
+      const response = await fetch('/api/ring/status', {cache: 'no-store'});
+      const data = await response.json();
+      const lines = [
+        `State: ${data.connected ? 'CONNECTED' : (data.enabled ? 'WAITING' : 'DISABLED')}`,
+        `Device: ${data.device_name || '--'}`,
+        `Battery: ${data.battery_life ?? '--'}`,
+        `Wi-Fi RSSI: ${data.wifi_signal_strength ?? '--'}`,
+        `Last poll: ${data.last_poll ? new Date(data.last_poll).toLocaleTimeString() : '--'}`,
+        data.last_event ? `Last event: ${data.last_event.kind} at ${new Date(data.last_event.timestamp).toLocaleTimeString()}` : '',
+        data.error || ''
+      ].filter(Boolean);
+      document.getElementById('ring-status').textContent = lines.join('\\n');
+      if (data.snapshot_available) {
+        document.getElementById('ring-snapshot').src = '/api/ring/snapshot?t=' + Date.now();
+      }
+    }
+
+    async function refreshSureSight() {
+      const response = await fetch('/api/sure-sight/status', {cache: 'no-store'});
+      const data = await response.json();
+      const lines = [
+        `State: ${data.connected ? 'CONNECTED' : 'WAITING'}`,
+        `Alert: ${data.alert_active ? 'ACTIVE' : 'IDLE'}`,
+        `Event ID: ${data.event_id ?? '--'}`,
+        `Projector: ${data.projector_enabled ? 'ENABLED' : 'STANDBY'}`,
+        `Message: ${data.message || '--'}`,
+        data.error || ''
+      ].filter(Boolean);
+      document.getElementById('sure-sight-status').textContent = lines.join('\\n');
+    }
+
+    async function refreshEvents() {
+      const response = await fetch('/api/events?limit=12', {cache: 'no-store'});
+      const data = await response.json();
+      const lines = data.events.map(event => {
+        const time = event.timestamp ? new Date(event.timestamp).toLocaleString() : '--';
+        const detail = event.kind || event.state || event.message || event.type;
+        return `${time} • ${event.source || 'platform'} • ${detail}`;
+      });
+      document.getElementById('event-timeline').textContent =
+        lines.length ? lines.join('\\n') : 'No recorded events yet.';
     }
 
     async function commandRover(command) {
@@ -119,7 +196,13 @@ DASHBOARD = """
     }
 
     refreshDistance();
+    refreshRing();
+    refreshSureSight();
+    refreshEvents();
     setInterval(refreshDistance, 3000);
+    setInterval(refreshRing, 10000);
+    setInterval(refreshSureSight, 1000);
+    setInterval(refreshEvents, 3000);
   </script>
 </body>
 </html>
@@ -149,6 +232,8 @@ def health():
         rover_tcp_port=ROVER_TCP_PORT,
         fixed_camera_stream=CAMERA_STREAM_URL,
         rover_camera_stream=ROVER_CAMERA_STREAM_URL,
+        ring=ring_collector.status(),
+        sure_sight=sure_sight_collector.status(),
         timestamp=now_iso(),
     )
 
@@ -162,13 +247,72 @@ def rover_distance():
     except RoverError as exc:
         return jsonify(error=str(exc), timestamp=timestamp), 503
 
+
 @app.get("/api/events")
 def recent_events():
+    from flask import request
+
+    try:
+        limit = min(max(int(request.args.get("limit", "100")), 1), 500)
+    except ValueError:
+        return jsonify(error="limit must be an integer", timestamp=now_iso()), 400
+
+    events: list[dict] = []
+    log_path = Path(EVENT_LOG_PATH)
+    if log_path.is_file():
+        try:
+            for line in log_path.read_text(encoding="utf-8").splitlines()[-limit:]:
+                try:
+                    event = json.loads(line)
+                    if (
+                        not event.get("source")
+                        and event.get("type") == "proximity_state_change"
+                    ):
+                        event["source"] = "rover"
+                    events.append(event)
+                except (json.JSONDecodeError, TypeError):
+                    app.logger.warning("Skipped malformed event-log line")
+        except OSError as exc:
+            return jsonify(error=f"Unable to read event log: {exc}", timestamp=now_iso()), 500
+
+    events.sort(key=lambda event: str(event.get("timestamp", "")), reverse=True)
     return jsonify(
-        events=analyzer.recent_events(),
-        sample_count=analyzer.sample_count,
+        events=events,
+        rover_sample_count=analyzer.sample_count,
+        persisted_event_count=len(events),
         timestamp=now_iso(),
     )
+
+
+@app.get("/api/ring/status")
+def ring_status():
+    return jsonify(**ring_collector.status())
+
+
+@app.get("/api/ring/events")
+def ring_events():
+    return jsonify(events=ring_collector.recent_events(), timestamp=now_iso())
+
+
+@app.get("/api/sure-sight/status")
+def sure_sight_status():
+    return jsonify(**sure_sight_collector.status())
+
+
+@app.get("/api/sure-sight/events")
+def sure_sight_events():
+    return jsonify(events=sure_sight_collector.recent_events(), timestamp=now_iso())
+
+
+@app.get("/api/ring/snapshot")
+def ring_snapshot():
+    status = ring_collector.status()
+    if not status["snapshot_available"]:
+        return jsonify(error="No Ring snapshot is available", timestamp=now_iso()), 404
+    response = send_file(ring_collector.snapshot_path.resolve(), mimetype="image/jpeg")
+    response.headers["Cache-Control"] = "no-store"
+    return response
+
 
 @app.post("/api/rover/stop")
 def rover_stop():
@@ -188,7 +332,9 @@ def rover_autonomous():
         return jsonify(error=str(exc), timestamp=now_iso()), 503
 
 
-def warm_serial_connection() -> None:
+def warm_connections() -> None:
+    ring_collector.start()
+    sure_sight_collector.start()
     try:
         rover.connect()
     except RoverError as exc:
@@ -196,5 +342,5 @@ def warm_serial_connection() -> None:
 
 
 if __name__ == "__main__":
-    threading.Thread(target=warm_serial_connection, daemon=True).start()
+    threading.Thread(target=warm_connections, daemon=True).start()
     app.run(host="0.0.0.0", port=5050, debug=False, threaded=True)
