@@ -1,0 +1,19 @@
+[Unit]
+Description=AI Security Robot Data Platform
+After=network-online.target sure-sight-security.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=trinity
+Group=trinity
+WorkingDirectory=/home/trinity/ai-security-robot-data-platform
+Environment="PYTHONUNBUFFERED=1"
+Environment="RING_ENABLED=true"
+Environment="RING_DEVICE_NAME=Front Door"
+ExecStart=/home/trinity/ai-security-robot-data-platform/.venv/bin/python -m app.main
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
