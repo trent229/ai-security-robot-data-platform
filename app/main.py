@@ -69,7 +69,10 @@ DASHBOARD = """
   <style>
     :root { color-scheme: dark; font-family: system-ui, sans-serif; }
     body { margin: 0; background: #071018; color: #e8f4ff; }
-    header { padding: 16px 20px; background: #0c1d2a; border-bottom: 1px solid #21455e; }
+    header { display: flex; align-items: center; gap: 14px; padding: 12px 20px;
+             background: #0c1d2a; border-bottom: 1px solid #21455e; }
+    .brand-logo { width: clamp(46px, 7vw, 72px); height: clamp(46px, 7vw, 72px);
+                  object-fit: contain; flex: 0 0 auto; border-radius: 8px; }
     h1 { margin: 0; font-size: clamp(20px, 3vw, 32px); }
     main { display: grid; gap: 16px; padding: 16px; grid-template-columns: 1fr 1fr; }
     .card { background: #102330; border: 1px solid #21455e; border-radius: 12px; padding: 14px; }
@@ -77,15 +80,20 @@ DASHBOARD = """
     .reading { font-size: 48px; font-weight: 700; color: #5eead4; }
     .status { color: #9fc2d8; white-space: pre-line; }
     .wide { grid-column: 1 / -1; }
-    button { width: 100%; margin-top: 10px; padding: 14px; border: 0; border-radius: 8px;
-             font-size: 17px; font-weight: 700; cursor: pointer; }
+    button { width: 100%; min-height: 48px; margin-top: 10px; padding: 10px 12px;
+             border: 0; border-radius: 8px; font-size: clamp(12px, 1.4vw, 15px);
+             line-height: 1.2; font-weight: 700; white-space: normal;
+             overflow-wrap: anywhere; cursor: pointer; }
     .stop { background: #ef4444; color: white; }
     .auto { background: #22c55e; color: #04130a; }
     @media (max-width: 800px) { main { grid-template-columns: 1fr; } .wide { grid-column: auto; } }
   </style>
 </head>
 <body>
-  <header><h1>AI Security Robot Data Platform</h1></header>
+  <header>
+    <img class="brand-logo" src="/static/suresight_logo.png" alt="Sure Sight logo">
+    <h1>AI Security Robot Data Platform</h1>
+  </header>
   <main>
     <section class="card">
       <h2>Fixed Security Camera</h2>
