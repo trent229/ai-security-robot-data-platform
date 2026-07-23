@@ -10,7 +10,7 @@ from flask import Flask, jsonify, render_template_string
 
 from app.rover import RoverError, RoverSerial
 from app.rover_tcp import RoverTCP
-
+from app.analytics import TelemetryAnalyzer
 
 CAMERA_STREAM_URL = os.getenv(
     "CAMERA_STREAM_URL", "http://127.0.0.1:5000/stream.mjpg"
@@ -28,7 +28,7 @@ if ROVER_TRANSPORT == "serial":
     rover = RoverSerial(port=ROVER_PORT)
 else:
     rover = RoverTCP(host=ROVER_HOST, port=ROVER_TCP_PORT)
-
+    analyzer = TelemetryAnalyzer()
 
 DASHBOARD = """
 <!doctype html>
@@ -86,8 +86,20 @@ DASHBOARD = """
         const response = await fetch('/api/rover/distance', {cache: 'no-store'});
         const data = await response.json();
         if (!response.ok) throw new Error(data.error || 'Rover unavailable');
-        document.getElementById('distance').textContent = `${data.distance_cm} cm`;
-        status.textContent = `Connected • ${new Date(data.timestamp).toLocaleTimeString()}`;
+        const distance = document.getElementById('distance');
+        distance.textContent = `${data.filtered_distance_cm} cm`;
+
+        const stateColors = {
+          CLEAR: '#5eead4',
+          CAUTION: '#facc15',
+          OBSTACLE: '#ef4444'
+        };
+        distance.style.color = stateColors[data.proximity_state] || '#5eead4';
+
+        status.textContent =
+          `${data.proximity_state} • Raw: ${data.distance_cm} cm • ` +
+          `Filtered: ${data.filtered_distance_cm} cm • ` +
+          `${new Date(data.timestamp).toLocaleTimeString()}`;
       } catch (error) {
         status.textContent = error.message;
       }
@@ -143,11 +155,20 @@ def health():
 
 @app.get("/api/rover/distance")
 def rover_distance():
+    timestamp = now_iso()
     try:
-        return jsonify(distance_cm=rover.distance_cm(), timestamp=now_iso())
+        reading = analyzer.record(rover.distance_cm(), timestamp)
+        return jsonify(**reading)
     except RoverError as exc:
-        return jsonify(error=str(exc), timestamp=now_iso()), 503
+        return jsonify(error=str(exc), timestamp=timestamp), 503
 
+@app.get("/api/events")
+def recent_events():
+    return jsonify(
+        events=analyzer.recent_events(),
+        sample_count=analyzer.sample_count,
+        timestamp=now_iso(),
+    )
 
 @app.post("/api/rover/stop")
 def rover_stop():

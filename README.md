@@ -12,6 +12,11 @@ ELEGOO Smart Robot Car V4.0 telemetry and control on an NVIDIA Jetson Orin Nano.
 - Rover camera: dual-network ESP32-S3 stream on the main LAN
 - Rover telemetry: ultrasonic distance in centimeters
 - Safety controls: stop and confirmed autonomous-mode start
+- Telemetry filtering: rolling five-sample median to reduce ultrasonic noise
+- Proximity classification: `CLEAR` above 50 cm, `CAUTION` from 26–50 cm,
+  and `OBSTACLE` at 25 cm or less
+- Event persistence: proximity state changes recorded in
+  `runtime/events.jsonl`
 
 ## Run
 
@@ -23,12 +28,25 @@ python -m app.main
 
 Open `http://JETSON_IP:5050/` from another device on the same network.
 
-The rover camera defaults to `http://192.168.1.251:81/stream`. Override a
+The rover camera defaults to `http://192.168.1.251/capture`.
 changed DHCP address when launching with:
 
 ```bash
 ROVER_CAMERA_STREAM_URL=http://NEW_IP:81/stream python -m app.main
 ```
+## Data API
+
+- `GET /api/rover/distance` returns the raw distance, median-filtered distance,
+  change from the previous filtered reading, proximity classification, sample
+  count, and timestamp.
+- `GET /api/events` returns recent proximity-state changes.
+- `GET /api/health` reports platform, camera, and rover connection settings.
+- `POST /api/rover/stop` sends the emergency-stop command.
+- `POST /api/rover/autonomous` starts autonomous mode after confirmation from
+  the dashboard.
+
+Runtime event logs are intentionally excluded from Git because they are
+generated during operation.
 
 ## Hardware state required
 
