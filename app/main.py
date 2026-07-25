@@ -11,10 +11,18 @@ from datetime import datetime, timezone
 from flask import Flask, jsonify, render_template_string, send_file
 
 from app.analytics import TelemetryAnalyzer
+from app.person_detection import PersonDetectionService
 from app.ring_camera import RingCameraCollector
 from app.rover import RoverError, RoverSerial
 from app.rover_tcp import RoverTCP
 from app.sure_sight import SureSightCollector
+
+
+def env_flag(name: str, default: bool = False) -> bool:
+    value = os.getenv(name)
+    if value is None:
+        return default
+    return value.lower() in {"1", "true", "yes", "on"}
 
 CAMERA_STREAM_URL = os.getenv(
     "CAMERA_STREAM_URL", "http://127.0.0.1:5000/stream.mjpg"
@@ -37,6 +45,29 @@ SURE_SIGHT_STATUS_URL = os.getenv(
     "SURE_SIGHT_STATUS_URL", "http://127.0.0.1:5000/api/status"
 )
 SURE_SIGHT_POLL_SECONDS = float(os.getenv("SURE_SIGHT_POLL_SECONDS", "1"))
+AI_ENABLED = env_flag("AI_ENABLED", False)
+AI_CAMERA_URL = os.getenv("AI_CAMERA_URL", ROVER_CAMERA_STREAM_URL)
+AI_MODEL_PATH = os.getenv(
+    "AI_MODEL_PATH",
+    "runtime/ai/person_detector.onnx",
+)
+AI_WRAPPER_PATH = os.getenv(
+    "AI_WRAPPER_PATH",
+    "runtime/ai/mp_persondet.py",
+)
+AI_SNAPSHOT_PATH = os.getenv(
+    "AI_SNAPSHOT_PATH",
+    "runtime/ai/latest_detection.jpg",
+)
+AI_POLL_SECONDS = float(os.getenv("AI_POLL_SECONDS", "5"))
+AI_SCORE_THRESHOLD = float(os.getenv("AI_SCORE_THRESHOLD", "0.45"))
+AI_EVENT_COOLDOWN_SECONDS = float(
+    os.getenv("AI_EVENT_COOLDOWN_SECONDS", "15")
+)
+AI_CAPTURE_TIMEOUT_SECONDS = float(
+    os.getenv("AI_CAPTURE_TIMEOUT_SECONDS", "20")
+)
+AI_AUTOMATIC_STOP = env_flag("AI_AUTOMATIC_STOP", False)
 
 app = Flask(__name__)
 if ROVER_TRANSPORT == "serial":
@@ -57,6 +88,20 @@ sure_sight_collector = SureSightCollector(
     status_url=SURE_SIGHT_STATUS_URL,
     poll_seconds=SURE_SIGHT_POLL_SECONDS,
     event_log_path=EVENT_LOG_PATH,
+)
+person_detector = PersonDetectionService(
+    enabled=AI_ENABLED,
+    camera_url=AI_CAMERA_URL,
+    model_path=AI_MODEL_PATH,
+    wrapper_path=AI_WRAPPER_PATH,
+    event_log_path=EVENT_LOG_PATH,
+    snapshot_path=AI_SNAPSHOT_PATH,
+    poll_seconds=AI_POLL_SECONDS,
+    score_threshold=AI_SCORE_THRESHOLD,
+    event_cooldown_seconds=AI_EVENT_COOLDOWN_SECONDS,
+    capture_timeout_seconds=AI_CAPTURE_TIMEOUT_SECONDS,
+    automatic_stop=AI_AUTOMATIC_STOP,
+    stop_callback=rover.stop,
 )
 
 DASHBOARD = """
@@ -120,6 +165,12 @@ DASHBOARD = """
       <p id="sure-sight-status" class="status">Loading Sure Sight status…</p>
     </section>
     <section class="card wide">
+      <h2>AI Person Detection</h2>
+      <img id="ai-snapshot" class="camera" alt="Latest AI person detection"
+           style="display:none">
+      <p id="ai-status" class="status">Loading AI detector status…</p>
+    </section>
+    <section class="card wide">
       <h2>Combined Event Timeline</h2>
       <p id="event-timeline" class="status">Loading recorded events…</p>
     </section>
@@ -178,6 +229,32 @@ DASHBOARD = """
       document.getElementById('sure-sight-status').textContent = lines.join('\\n');
     }
 
+    async function refreshAI() {
+      const response = await fetch('/api/ai/status', {cache: 'no-store'});
+      const data = await response.json();
+      const confidence = data.confidence == null
+        ? '--'
+        : `${(data.confidence * 100).toFixed(1)}%`;
+      const lines = [
+        `State: ${data.enabled ? (data.running ? 'RUNNING' : 'STOPPED') : 'DISABLED'}`,
+        `Camera: ${data.connected ? 'CONNECTED' : 'WAITING'}`,
+        `Person: ${data.person_detected ? 'DETECTED' : 'NOT DETECTED'}`,
+        `Confidence: ${confidence}`,
+        `Inference: ${data.inference_ms ?? '--'} ms`,
+        `Detection events: ${data.detection_events ?? 0}`,
+        `Automatic stop: ${data.automatic_stop_enabled ? 'ENABLED' : 'DISABLED'}`,
+        `Last action: ${data.last_action || '--'}`,
+        data.error || ''
+      ].filter(Boolean);
+      document.getElementById('ai-status').textContent = lines.join('\\n');
+
+      const snapshot = document.getElementById('ai-snapshot');
+      if (data.snapshot_available) {
+        snapshot.src = '/api/ai/snapshot?t=' + Date.now();
+        snapshot.style.display = 'block';
+      }
+    }
+
     async function refreshEvents() {
       const response = await fetch('/api/events?limit=12', {cache: 'no-store'});
       const data = await response.json();
@@ -206,10 +283,12 @@ DASHBOARD = """
     refreshDistance();
     refreshRing();
     refreshSureSight();
+    refreshAI();
     refreshEvents();
     setInterval(refreshDistance, 3000);
     setInterval(refreshRing, 10000);
     setInterval(refreshSureSight, 1000);
+    setInterval(refreshAI, 2000);
     setInterval(refreshEvents, 3000);
   </script>
 </body>
@@ -242,6 +321,7 @@ def health():
         rover_camera_stream=ROVER_CAMERA_STREAM_URL,
         ring=ring_collector.status(),
         sure_sight=sure_sight_collector.status(),
+        ai_person_detection=person_detector.status(),
         timestamp=now_iso(),
     )
 
@@ -312,6 +392,26 @@ def sure_sight_events():
     return jsonify(events=sure_sight_collector.recent_events(), timestamp=now_iso())
 
 
+@app.get("/api/ai/status")
+def ai_status():
+    return jsonify(**person_detector.status())
+
+
+@app.get("/api/ai/events")
+def ai_events():
+    return jsonify(events=person_detector.recent_events(), timestamp=now_iso())
+
+
+@app.get("/api/ai/snapshot")
+def ai_snapshot():
+    status = person_detector.status()
+    if not status["snapshot_available"]:
+        return jsonify(error="No AI detection snapshot is available", timestamp=now_iso()), 404
+    response = send_file(person_detector.snapshot_path.resolve(), mimetype="image/jpeg")
+    response.headers["Cache-Control"] = "no-store"
+    return response
+
+
 @app.get("/api/ring/snapshot")
 def ring_snapshot():
     status = ring_collector.status()
@@ -343,6 +443,7 @@ def rover_autonomous():
 def warm_connections() -> None:
     ring_collector.start()
     sure_sight_collector.start()
+    person_detector.start()
     try:
         rover.connect()
     except RoverError as exc:
