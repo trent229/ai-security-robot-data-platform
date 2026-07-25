@@ -11,6 +11,11 @@ WorkingDirectory=/home/trinity/ai-security-robot-data-platform
 Environment="PYTHONUNBUFFERED=1"
 Environment="RING_ENABLED=true"
 Environment="RING_DEVICE_NAME=Front Door"
+Environment="AI_ENABLED=true"
+Environment="AI_CAMERA_URL=http://192.168.1.251/capture"
+Environment="AI_SCORE_THRESHOLD=0.45"
+Environment="AI_POLL_SECONDS=5"
+Environment="AI_AUTOMATIC_STOP=false"
 ExecStart=/home/trinity/ai-security-robot-data-platform/.venv/bin/python -m app.main
 Restart=on-failure
 RestartSec=5
