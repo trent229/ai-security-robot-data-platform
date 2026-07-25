@@ -1,3 +1,5 @@
 Flask>=3.1,<4
+numpy>=1.23,<3
+opencv-python-headless>=4.10,<5
 pyserial>=3.5,<4
 ring-doorbell>=0.9.14,<0.10
